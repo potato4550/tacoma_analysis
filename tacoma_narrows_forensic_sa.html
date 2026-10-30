@@ -1,0 +1,284 @@
+<style>
+.panel{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:12px 14px;margin-bottom:10px}
+.panel-title{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--color-text-tertiary);margin-bottom:8px;font-weight:500}
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}
+.stat{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:8px 10px}
+.slabel{font-size:10px;color:var(--color-text-tertiary);margin-bottom:2px}
+.sval{font-size:14px;font-weight:500}
+.ctrl{display:flex;gap:8px;align-items:center;margin-bottom:6px;font-size:12px}
+.ctrl label{min-width:130px;color:var(--color-text-secondary);flex-shrink:0}
+.ctrl input[type=range]{flex:1}
+.ctrl span{min-width:52px;color:var(--color-text-primary);font-weight:500;font-size:11px}
+canvas{border-radius:var(--border-radius-md);border:0.5px solid var(--color-border-tertiary);width:100%;display:block}
+.finding{border-left:3px solid var(--color-border-danger);padding:8px 12px;border-radius:0 var(--border-radius-md) var(--border-radius-md) 0;background:var(--color-background-danger);margin-bottom:6px;font-size:11px;color:var(--color-text-danger);line-height:1.55}
+.finding.safe{border-left-color:var(--color-border-success);background:var(--color-background-success);color:var(--color-text-success)}
+.finding.warn{border-left-color:var(--color-border-warning);background:var(--color-background-warning);color:var(--color-text-warning)}
+.btn-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.legend-row{display:flex;gap:12px;font-size:10px;color:var(--color-text-secondary);margin-bottom:6px;flex-wrap:wrap;align-items:center}
+.leg-swatch{width:12px;height:12px;border-radius:2px;display:inline-block;margin-right:3px;vertical-align:middle}
+</style>
+
+<div class="stat-grid">
+  <div class="stat"><div class="slabel">Wind speed (actual)</div><div class="sval" style="color:#E24B4A" id="sWind">42 mph</div></div>
+  <div class="stat"><div class="slabel">Flutter onset</div><div class="sval" style="color:#f2c94c" id="sFlutter">35 mph</div></div>
+  <div class="stat"><div class="slabel">Damping ratio ζ</div><div class="sval" id="sDamp">—</div></div>
+  <div class="stat"><div class="slabel">Safety margin</div><div class="sval" id="sMargin">—</div></div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">Design parameters — adjust to see what would have saved the bridge</div>
+  <div class="ctrl">
+    <label>Wind speed U (mph)</label>
+    <input type="range" id="windSlider" min="10" max="80" value="42" step="1" oninput="update()">
+    <span id="windOut">42 mph</span>
+  </div>
+  <div class="ctrl">
+    <label>Structural damping ζ</label>
+    <input type="range" id="dampSlider" min="1" max="80" value="3" step="1" oninput="update()">
+    <span id="dampOut">0.03</span>
+  </div>
+  <div class="ctrl">
+    <label>Depth-to-span ratio ×100</label>
+    <input type="range" id="depthSlider" min="20" max="400" value="28" step="1" oninput="update()">
+    <span id="depthOut">1/357</span>
+  </div>
+  <div class="ctrl">
+    <label>Deck width (ft)</label>
+    <input type="range" id="widthSlider" min="20" max="120" value="39" step="1" oninput="update()">
+    <span id="widthOut">39 ft</span>
+  </div>
+  <div class="ctrl">
+    <label>Torsional stiffness GJ</label>
+    <input type="range" id="stiffSlider" min="10" max="300" value="30" step="1" oninput="update()">
+    <span id="stiffOut">30%</span>
+  </div>
+</div>
+
+<div id="findings" style="margin-bottom:10px"></div>
+
+<div class="btn-row">
+  <button onclick="setScenario('actual')">1940 actual design</button>
+  <button onclick="setScenario('golden_gate')">Golden Gate equivalent</button>
+  <button onclick="setScenario('minimal_fix')">Minimal fix</button>
+  <button onclick="setScenario('truss')">Truss design (safe)</button>
+  <button onclick="sendPrompt('What specific design changes were made to the replacement Tacoma Narrows Bridge opened in 1950?')">1950 replacement ↗</button>
+</div>
+
+<div class="legend-row">
+  <span><span class="leg-swatch" style="background:#2ecc71"></span>Stable (positive damping)</span>
+  <span><span class="leg-swatch" style="background:#f39c12"></span>Warning zone</span>
+  <span><span class="leg-swatch" style="background:#e74c3c"></span>Flutter onset (negative damping)</span>
+  <span><span class="leg-swatch" style="background:#8e44ad"></span>Collapse region</span>
+</div>
+
+<div style="position:relative;width:100%;height:300px;margin-bottom:10px">
+  <canvas id="terrainChart"></canvas>
+</div>
+<div style="position:relative;width:100%;height:200px">
+  <canvas id="sobolChart"></canvas>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const SPAN = 2800;
+const COLLAPSE_WIND = 42;
+const FLUTTER_ONSET = 35;
+
+function computeFlutterSpeed(depth_ratio, damping, width, stiff) {
+  const d = depth_ratio / 10000;
+  const base_flutter = 35 * (1 + damping * 0.8) * Math.sqrt(d * 350) * (width / 39) * (stiff / 30);
+  return Math.max(15, Math.min(120, base_flutter));
+}
+
+function computeDamping(dampPct) { return dampPct / 100; }
+
+function computeSafetyMargin(flutterSpeed, windSpeed) {
+  return ((flutterSpeed - windSpeed) / windSpeed * 100);
+}
+
+function computeFragility(wind, depth, damp, width, stiff) {
+  const fs = computeFlutterSpeed(depth, damp, width, stiff);
+  if (wind < fs * 0.7) return 0.05 + Math.random() * 0.1;
+  if (wind < fs * 0.9) return 0.3 + (wind - fs*0.7)/(fs*0.2) * 0.3;
+  if (wind < fs)       return 0.6 + (wind - fs*0.9)/(fs*0.1) * 0.3;
+  return Math.min(1.0, 0.9 + (wind - fs) / fs * 2);
+}
+
+function fragToColor(f) {
+  if (f < 0.25) return `rgba(46,204,113,${0.4+f*2})`;
+  if (f < 0.5)  return `rgba(243,156,18,${0.5+f})`;
+  if (f < 0.75) return `rgba(231,76,60,${0.6+f*0.4})`;
+  return `rgba(142,68,173,${0.7+f*0.3})`;
+}
+
+let terrainChart, sobolChart;
+
+function buildTerrainChart() {
+  const ctx = document.getElementById('terrainChart').getContext('2d');
+  const N = 30;
+  const windVals = Array.from({length:N}, (_,i) => Math.round(10 + i*70/(N-1)));
+  const dampVals = Array.from({length:N}, (_,i) => Math.round(1 + i*79/(N-1)));
+
+  const depth = +document.getElementById('depthSlider').value;
+  const width = +document.getElementById('widthSlider').value;
+  const stiff = +document.getElementById('stiffSlider').value;
+
+  const datasets = dampVals.map(damp => ({
+    label: '',
+    data: windVals.map(w => {
+      const f = computeFragility(w, depth, damp, width, stiff);
+      return {x: w, y: damp/100, r: 4.5, fragility: f};
+    }),
+    backgroundColor: dampVals.map(d => windVals.map(w => {
+      const f = computeFragility(w, depth, d, width, stiff);
+      return fragToColor(f);
+    })).flat(),
+    pointStyle: 'rect',
+  }));
+
+  if (terrainChart) terrainChart.destroy();
+  terrainChart = new Chart(ctx, {
+    type: 'bubble',
+    data: { datasets: [{
+      label: 'Fragility',
+      data: windVals.flatMap(w => dampVals.map(d => ({
+        x: w, y: d/100, r: 5.5,
+        fragility: computeFragility(w, depth, d, width, stiff)
+      }))),
+      backgroundColor: windVals.flatMap(w => dampVals.map(d =>
+        fragToColor(computeFragility(w, depth, d, width, stiff))
+      )),
+    }]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: {display:false}, tooltip: {
+        callbacks: { label: ctx => {
+          const d = ctx.raw;
+          return [`Wind: ${d.x} mph`, `Damping: ${(d.y*100).toFixed(0)}%`, `Fragility: ${d.fragility.toFixed(2)}`];
+        }}
+      }},
+      scales: {
+        x: { title:{display:true,text:'Wind speed (mph)',color:'#888'}, ticks:{color:'#888'}, grid:{color:'rgba(128,128,128,0.15)'},
+             min:10, max:80,
+             afterDataLimits: scale => { scale.max = 80; scale.min = 10; }
+           },
+        y: { title:{display:true,text:'Structural damping ζ',color:'#888'}, ticks:{color:'#888', callback: v => v.toFixed(2)}, grid:{color:'rgba(128,128,128,0.15)'}, min:0, max:0.82 }
+      },
+      layout: { padding: { top:10, right:10 } }
+    }
+  });
+
+  const curWind = +document.getElementById('windSlider').value;
+  const curDamp = +document.getElementById('dampSlider').value / 100;
+  terrainChart.options.plugins.annotation = {};
+}
+
+function buildSobolChart() {
+  const ctx = document.getElementById('sobolChart').getContext('2d');
+  const wind  = +document.getElementById('windSlider').value;
+  const damp  = +document.getElementById('dampSlider').value;
+  const depth = +document.getElementById('depthSlider').value;
+  const width = +document.getElementById('widthSlider').value;
+  const stiff = +document.getElementById('stiffSlider').value;
+  const nom   = computeFragility(wind, depth, damp, width, stiff);
+
+  const inputs = ['Wind speed','Damping ζ','Depth ratio','Deck width','Torsional stiff.'];
+  const colors = ['#e74c3c','#3498db','#f39c12','#2ecc71','#9b59b6'];
+
+  const S1 = inputs.map((_, i) => {
+    let total = 0, N = 20;
+    for (let j=0;j<N;j++) {
+      const perturb = 0.15 * (Math.random()-0.5);
+      let args = [wind, depth, damp, width, stiff];
+      args[i] = args[i] * (1 + perturb);
+      total += Math.abs(computeFragility(...[args[0],args[1],args[2],args[3],args[4]]) - nom);
+    }
+    return total / N;
+  });
+  const total = S1.reduce((a,b)=>a+b,0) || 1;
+  const S1norm = S1.map(v => +(v/total*100).toFixed(1));
+
+  if (sobolChart) sobolChart.destroy();
+  sobolChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: inputs,
+      datasets: [{
+        label: 'Sensitivity index S₁ (%)',
+        data: S1norm,
+        backgroundColor: colors,
+        borderRadius: 4,
+        borderSkipped: false,
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend:{display:false}, tooltip:{callbacks:{label: ctx => `S₁ = ${ctx.raw}%`}} },
+      scales: {
+        x: { title:{display:true,text:'Sensitivity index S₁ (% of total output variance)',color:'#888'}, ticks:{color:'#888',callback:v=>v+'%'}, grid:{color:'rgba(128,128,128,0.15)'}, max:100 },
+        y: { ticks:{color:'#888'}, grid:{display:false} }
+      }
+    }
+  });
+}
+
+function update() {
+  const wind  = +document.getElementById('windSlider').value;
+  const dampP = +document.getElementById('dampSlider').value;
+  const depth = +document.getElementById('depthSlider').value;
+  const width = +document.getElementById('widthSlider').value;
+  const stiff = +document.getElementById('stiffSlider').value;
+  const damp  = dampP / 100;
+
+  document.getElementById('windOut').textContent  = wind + ' mph';
+  document.getElementById('dampOut').textContent  = damp.toFixed(2);
+  document.getElementById('depthOut').textContent = '1/' + Math.round(10000/depth);
+  document.getElementById('widthOut').textContent = width + ' ft';
+  document.getElementById('stiffOut').textContent = stiff + '%';
+
+  const fs = computeFlutterSpeed(depth, dampP, width, stiff);
+  const margin = computeSafetyMargin(fs, wind);
+  const fragility = computeFragility(wind, depth, dampP, width, stiff);
+
+  document.getElementById('sWind').textContent   = wind + ' mph';
+  document.getElementById('sDamp').textContent   = damp.toFixed(3);
+  document.getElementById('sMargin').textContent = (margin >= 0 ? '+' : '') + margin.toFixed(1) + '%';
+  document.getElementById('sMargin').style.color = margin > 20 ? '#2ecc71' : margin > 0 ? '#f39c12' : '#e74c3c';
+  document.getElementById('sFlutter').textContent = Math.round(fs) + ' mph';
+
+  const findings = document.getElementById('findings');
+  let html = '';
+  if (fragility < 0.25) {
+    html = `<div class="finding safe">System is stable. Flutter onset at ${Math.round(fs)} mph — ${Math.round(margin)}% above current wind speed. Positive damping throughout.</div>`;
+  } else if (fragility < 0.6) {
+    html = `<div class="finding warn">Warning zone. Flutter onset at ${Math.round(fs)} mph is only ${Math.round(margin)}% above wind speed. Small gusts could trigger instability. Increase damping or stiffness.</div>`;
+  } else if (fragility < 0.85) {
+    html = `<div class="finding">Critical — negative damping active. Wind speed ${wind} mph exceeds flutter onset ${Math.round(fs)} mph. Torsional oscillation is self-amplifying. Collapse probable.</div>`;
+  } else {
+    html = `<div class="finding">Collapse imminent. Fragility = ${fragility.toFixed(2)}. This matches the actual 1940 conditions. The bridge had no mechanism to arrest growing oscillation amplitude.</div>`;
+  }
+  findings.innerHTML = html;
+
+  buildTerrainChart();
+  buildSobolChart();
+}
+
+function setScenario(s) {
+  const scenarios = {
+    actual:       [42, 3,  28,  39, 30],
+    golden_gate:  [42, 12, 100, 90, 200],
+    minimal_fix:  [42, 8,  28,  39, 80],
+    truss:        [42, 15, 200, 90, 250],
+  };
+  const [w,d,r,wi,st] = scenarios[s];
+  document.getElementById('windSlider').value  = w;
+  document.getElementById('dampSlider').value  = d;
+  document.getElementById('depthSlider').value = r;
+  document.getElementById('widthSlider').value = wi;
+  document.getElementById('stiffSlider').value = st;
+  update();
+}
+
+update();
+</script>
